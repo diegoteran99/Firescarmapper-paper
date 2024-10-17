@@ -14,3 +14,4 @@ env/
 
 *.pyc
 __pycache__/
+firescarmapping/__pycache__/
