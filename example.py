@@ -41,10 +41,12 @@ from qgis.PyQt.QtGui import QColor, QIcon
 from qgis.PyQt.QtWidgets import QAction, QDialog, QVBoxLayout, QPushButton, QFileDialog
 
 from PyQt5.QtWidgets import QVBoxLayout, QPushButton, QFileDialog, QLabel, QDialog, QTextEdit, QHBoxLayout, QMessageBox
+import geopandas as gpd
 
 class FireScarMapper(QgsProcessingAlgorithm):
     IN_BEFORE = "BeforeRasters"
     IN_AFTER = "AfterRasters"
+    IN_SHP = "Shapefile"
     OUT_SCARS = "OutputScars"
     model_download_url = "https://fire2a-firescar-as-model.s3.amazonaws.com/ep25_lr1e-04_bs16_021__as_std_adam_f01_13_07_x3.model"
     model_path = os.path.join(os.path.dirname(__file__), 'firescarmapping', 'ep25_lr1e-04_bs16_021__as_std_adam_f01_13_07_x3.model')
@@ -54,18 +56,48 @@ class FireScarMapper(QgsProcessingAlgorithm):
             feedback.pushInfo("Model not found. Initializing download...")
             self.download_model(feedback)
 
-        before_paths = parameters['BeforeRasters']
+        before_paths, burnt_paths, shp_file = parameters['BeforeRasters'], parameters['AfterRasters'], parameters['Shapefile'] 
         #feedback.pushInfo(f"Input rasters:\n names: {[r.name() for r in before]}\ntypes: {[r.rasterType() for r in before]}")
         feedback.pushInfo(f"{before_paths=}")
-        burnt_paths = parameters['AfterRasters']
-        feedback.pushInfo(f"{burnt_paths=}")
+        #feedback.pushInfo(f"{burnt_paths=}")
+        not_cropped_paths = before_paths + burnt_paths
         #feedback.pushInfo(f"Input rasters:\n names: {[r.name() for r in burnt]}\ntypes: {[r.rasterType() for r in burnt]}")
-        before, burnt = [], []
+        before, burnt, cropped_before_paths, cropped_burnt_paths = [], [], [], []
         for i in range(len(before_paths)):
             before_name = parameters['BeforeRasters'][i].split("/")[-1]
+            feedback.pushInfo(f"{before_name=}")
             burnt_name = parameters['AfterRasters'][i].split("/")[-1]
-            before.append(QgsRasterLayer(parameters['BeforeRasters'][i], before_name, "gdal"))
-            burnt.append(QgsRasterLayer(parameters['AfterRasters'][i], burnt_name, "gdal"))
+            image_id = before_name.split('_')[2]  # Suponiendo que el ID está en la tercera parte del nombre
+        
+            # Obtener las coordenadas desde el archivo .shp usando el ID de la imagen
+            bounds = self.get_bounds_from_shp(shp_file, image_id)
+
+            # Generar rutas para las imágenes recortadas
+            cropped_before_path = os.path.join(os.path.dirname(__file__), 'results', before_name.replace(".tif","_clip.tif"))
+            cropped_before_paths.append(cropped_before_path)
+            #feedback.pushInfo(f"Cropping before image to: {cropped_before_path}")
+            cropped_burnt_path = os.path.join(os.path.dirname(__file__), 'results', burnt_name.replace(".tif","_clip.tif"))
+            cropped_burnt_paths.append(cropped_burnt_path)
+            #feedback.pushInfo(f"Cropping burnt image to: {cropped_burnt_path}")
+            cropped_paths = [cropped_before_path] + [cropped_burnt_path]
+            #feedback.pushInfo(f"{cropped_paths=}")
+            # Recortar las imágenes usando las coordenadas
+            self.crop_image_with_bounds(before_paths[i], cropped_before_path, bounds)
+            #feedback.pushInfo(f"Checking cropped before image at: {cropped_before_path}")
+            if not os.path.exists(cropped_before_path):
+                raise QgsProcessingException(f"Failed to crop before image: {cropped_before_path}")
+
+            self.crop_image_with_bounds(burnt_paths[i], cropped_burnt_path, bounds)
+            #feedback.pushInfo(f"Checking cropped burnt image at: {cropped_burnt_path}")
+            if not os.path.exists(cropped_burnt_path):
+                raise QgsProcessingException(f"Failed to crop burnt image: {cropped_burnt_path}")
+
+
+            # Cargar las imágenes recortadas como capas de QGIS
+            before.append(QgsRasterLayer(cropped_before_path, before_name.replace(".tif","_clip.tif"), "gdal"))
+            burnt.append(QgsRasterLayer(cropped_burnt_path, burnt_name.replace(".tif","_clip.tif"), "gdal"))
+
+        cropped_paths = cropped_before_paths + cropped_burnt_paths
 
         model_path = os.path.join(os.path.dirname(__file__), 'firescarmapping', 'ep25_lr1e-04_bs16_021__as_std_adam_f01_13_07_x3.model')
         
@@ -73,6 +105,11 @@ class FireScarMapper(QgsProcessingAlgorithm):
         if not os.path.exists(results_dir):
             os.makedirs(results_dir)
             feedback.pushInfo(f"Created results directory at: {results_dir}")
+
+        if not os.path.exists(cropped_before_path):
+            raise QgsProcessingException(f"Cropped image not found: {cropped_before_path}")
+        if not os.path.exists(cropped_burnt_path):
+            raise QgsProcessingException(f"Cropped image not found: {cropped_burnt_path}")
 
         # Asegurarse de que las capas sean listas de QgsRasterLayer
         if not isinstance(before, list) or not isinstance(burnt, list):
@@ -90,7 +127,8 @@ class FireScarMapper(QgsProcessingAlgorithm):
                 "name": layer.name()[8:],
                 "data": self.get_rlayer_data(layer),
                 "layer": layer,
-                "path": layer.dataProvider().dataSourceUri(),
+                "path": cropped_paths[i],
+                "not_cropped_path": not_cropped_paths[i],
                 "output_path":os.path.join(results_dir, f"FireScar_{layer.name()[8:][0:]}")
             }
             adict.update(self.get_rlayer_info(layer))
@@ -113,6 +151,7 @@ class FireScarMapper(QgsProcessingAlgorithm):
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
         feedback.pushInfo(f"{before_files=}")
+        feedback.pushInfo(f"{after_files=}")
         np.random.seed(3)
         torch.manual_seed(3)    
         
@@ -124,6 +163,9 @@ class FireScarMapper(QgsProcessingAlgorithm):
         model.eval()
 
         for i, batch in enumerate(all_dl):
+            feedback.pushInfo(f"{i=}")
+            feedback.pushInfo(f"{before_files[i]['name']=}")
+
             x = batch['img'].float().to(device)
             output = model(x).cpu()
 
@@ -150,8 +192,10 @@ class FireScarMapper(QgsProcessingAlgorithm):
                 
                 self.writeRaster(generated_matrix, before_files[i]['output_path'], before_files[i], feedback)
                 self.addRasterLayer(before_files[i]['output_path'],f"FireScar_{before_files[i]['name']}", group, context)
-                self.addRasterLayer(after_files[i]['path'],f"ImgPosF_{after_files[i]['name']}", group, context)
-                self.addRasterLayer(before_files[i]['path'],f"ImgPreF_{before_files[i]['name']}", group, context)
+                self.addRasterLayer(after_files[i]['not_cropped_path'],f"ImgPosF_{after_files[i]['name']}", group, context)
+                feedback.pushInfo(f"After file path: {after_files[i]['path']}")
+                feedback.pushInfo(f"layer_name = ImgPosF_{after_files[i]['name']}")
+                self.addRasterLayer(before_files[i]['not_cropped_path'],f"ImgPreF_{before_files[i]['name']}", group, context)
         return {}
         
     
@@ -205,27 +249,72 @@ class FireScarMapper(QgsProcessingAlgorithm):
             # Manejo de cualquier error que pueda ocurrir durante la solicitud
             feedback.pushInfo(f"Failed to download model: {str(e)}")
     
+    
+
+    def get_bounds_from_shp(self, shp_file, image_id):
+        """Buscar las coordenadas de recorte en el archivo .shp usando el ID de la imagen."""
+        # Leer el archivo .shp
+        shapefile = gpd.read_file(shp_file)
+
+        # Filtrar según el ID de la imagen
+        filtered_row = shapefile[shapefile['FireID'] == image_id]
+        
+        if filtered_row.empty:
+            raise ValueError(f"ID {image_id} not found in shapefile")
+
+        # Extraer los valores de las coordenadas
+        north_bound = filtered_row['NorthBound'].values[0]
+        south_bound = filtered_row['SouthBound'].values[0]
+        west_bound = filtered_row['WestBoundL'].values[0]
+        east_bound = filtered_row['EastBoundL'].values[0]
+
+        return north_bound, south_bound, west_bound, east_bound
+
+   
+    def crop_image_with_bounds(self, image_path, output_path, bounds):
+        """Recortar la imagen usando gdal y las coordenadas obtenidas del archivo .shp."""
+        
+        # Abrir la imagen con gdal
+        image = gdal.Open(image_path)
+        
+        # Definir los parámetros de geotransformación y las coordenadas de recorte
+        gt = image.GetGeoTransform()
+        
+        min_x = bounds[2]  # west_bound
+        max_x = bounds[3]  # east_bound
+        min_y = bounds[1]  # south_bound
+        max_y = bounds[0]  # north_bound
+
+        # Ejecutar el recorte utilizando gdal.Warp
+        gdal.Warp(output_path, 
+                image, 
+                outputBounds=(min_x, min_y, max_x, max_y),
+                dstNodata=0)
+        
+        # Cerrar la imagen de origen
+        image = None
+
 
     def qgis2numpy_dtype(self, qgis_dtype: Qgis.DataType) -> np.dtype:
         """Conver QGIS data type to corresponding numpy data type
         https://raw.githubusercontent.com/PUTvision/qgis-plugin-deepness/fbc99f02f7f065b2f6157da485bef589f611ea60/src/deepness/processing/processing_utils.py
         This is modified and extended copy of GDALDataType.
 
-        * ``UnknownDataType``: Unknown or unspecified type
-        * ``Byte``: Eight bit unsigned integer (quint8)
-        * ``Int8``: Eight bit signed integer (qint8) (added in QGIS 3.30)
-        * ``UInt16``: Sixteen bit unsigned integer (quint16)
-        * ``Int16``: Sixteen bit signed integer (qint16)
-        * ``UInt32``: Thirty two bit unsigned integer (quint32)
-        * ``Int32``: Thirty two bit signed integer (qint32)
-        * ``Float32``: Thirty two bit floating point (float)
-        * ``Float64``: Sixty four bit floating point (double)
-        * ``CInt16``: Complex Int16
-        * ``CInt32``: Complex Int32
-        * ``CFloat32``: Complex Float32
-        * ``CFloat64``: Complex Float64
-        * ``ARGB32``: Color, alpha, red, green, blue, 4 bytes the same as QImage.Format_ARGB32
-        * ``ARGB32_Premultiplied``: Color, alpha, red, green, blue, 4 bytes  the same as QImage.Format_ARGB32_Premultiplied
+        * `UnknownDataType: Unknown or unspecified type
+        * `Byte: Eight bit unsigned integer (quint8)
+        * `Int8: Eight bit signed integer (qint8) (added in QGIS 3.30)
+        * `UInt16: Sixteen bit unsigned integer (quint16)
+        * `Int16: Sixteen bit signed integer (qint16)
+        * `UInt32: Thirty two bit unsigned integer (quint32)
+        * `Int32: Thirty two bit signed integer (qint32)
+        * `Float32: Thirty two bit floating point (float)
+        * `Float64: Sixty four bit floating point (double)
+        * `CInt16: Complex Int16
+        * `CInt32: Complex Int32
+        * `CFloat32: Complex Float32
+        * `CFloat64: Complex Float64
+        * `ARGB32: Color, alpha, red, green, blue, 4 bytes the same as QImage.Format_ARGB32
+        * `ARGB32_Premultiplied: Color, alpha, red, green, blue, 4 bytes  the same as QImage.Format_ARGB32_Premultiplied
         """
         if qgis_dtype == Qgis.DataType.Byte or qgis_dtype == "Byte":
             return np.uint8
@@ -408,13 +497,6 @@ class FireScarMapper(QgsProcessingAlgorithm):
             layer.reload()
 
 
-
-
-
-
-
-
-
     def name(self):
         return "firescarmapper"
     
@@ -448,6 +530,10 @@ class LayerSelectionDialog(QDialog):
         self.post_fire_button = QPushButton("Select Post-Fire Images")
         self.post_fire_button.clicked.connect(self.select_post_fire_files)
 
+        # Añadir al diálogo la opción de seleccionar el archivo .shp
+        self.shp_button = QPushButton("Select Shapefile")
+        self.shp_button.clicked.connect(self.select_shp_file)
+
         # Campo de texto para mostrar las rutas seleccionadas de imágenes pre-incendio
         self.pre_fire_display = QTextEdit(self)
         self.pre_fire_display.setReadOnly(True)
@@ -458,6 +544,11 @@ class LayerSelectionDialog(QDialog):
         self.post_fire_display.setReadOnly(True)
         self.post_fire_display.setPlaceholderText("Post-fire images will be displayed here...")
 
+        # Campo de texto para mostrar la ruta seleccionada del archivo .shp
+        self.shp_display = QTextEdit(self)
+        self.shp_display.setReadOnly(True)
+        self.shp_display.setPlaceholderText("Shapefile will be displayed here...")
+
         # Botón para ejecutar el procesamiento
         self.run_button = QPushButton("Run Fire Scar Mapping")
         self.run_button.clicked.connect(self.run_fire_scar_mapping)
@@ -466,8 +557,13 @@ class LayerSelectionDialog(QDialog):
         left_layout = QVBoxLayout()
         left_layout.addWidget(self.pre_fire_button)
         left_layout.addWidget(self.pre_fire_display)
+
         left_layout.addWidget(self.post_fire_button)
         left_layout.addWidget(self.post_fire_display)
+        # Añadir esto al layout
+        left_layout.addWidget(self.shp_button)
+        left_layout.addWidget(self.shp_display)
+
         left_layout.addWidget(self.run_button)
 
         # Layout principal: distribución en dos columnas (selectores a la izquierda, descripción a la derecha)
@@ -508,7 +604,10 @@ class LayerSelectionDialog(QDialog):
 
             <b>Considerations:</b><br>
             - The segmentation model is pre-trained and stored locally, and it will only be downloaded when necessary.<br>
-            - In the pre- and post-fire image layers, the red and blue bands are swapped. You can fix this manually by adjusting the symbology properties of each layer.
+            - In the pre- and post-fire image layers, the red and blue bands are swapped. You can fix this manually by adjusting the symbology properties of each layer.<br>
+
+            <b>Image Example:</b><br>
+            <img src=":/plugins/example/images/diagrama_2_plugin.png" alt="Example Image" width="500" height="300"><br>
 
         """
 
@@ -524,14 +623,22 @@ class LayerSelectionDialog(QDialog):
         if self.post_fire_files:
             self.post_fire_display.setText("\n".join(self.post_fire_files))
 
+    def select_shp_file(self):
+        """Seleccionar el archivo .shp que contiene las coordenadas."""
+        self.shp_file, _ = QFileDialog.getOpenFileName(self, "Select Shapefile", "", "Shapefile (*.shp)")
+        if self.shp_file:
+            self.shp_display.setText(self.shp_file)
+
+
     def run_fire_scar_mapping(self):
         """Ejecutar el procesamiento una vez seleccionadas las imágenes."""
         pre_fire_files = self.pre_fire_files
         post_fire_files = self.post_fire_files
+        shp_file = self.shp_file  # Añadir el archivo .shp
 
-        # Verificar que se hayan seleccionado imágenes
-        if not pre_fire_files or not post_fire_files:
-            QMessageBox.warning(self, "Error", "Please select both pre-fire and post-fire images.")
+        # Verificar que se hayan seleccionado imágenes y el shapefile
+        if not pre_fire_files or not post_fire_files or not shp_file:
+            QMessageBox.warning(self, "Error", "Please select both pre-fire, post-fire images and a shapefile.")
             return
 
         # Crear un feedback para mostrar el progreso y los mensajes
@@ -543,6 +650,7 @@ class LayerSelectionDialog(QDialog):
         parameters = {
             'BeforeRasters': pre_fire_files,
             'AfterRasters': post_fire_files,
+            'Shapefile': shp_file,  # Agregar shapefile a los parámetros
             'OutputScars': os.path.join(os.path.dirname(__file__), 'results', 'OutputScar.tif')
         }
 
@@ -552,6 +660,7 @@ class LayerSelectionDialog(QDialog):
         feedback.pushInfo("Fire scar mapping process completed successfully.")
 
         self.close()
+
 
 
 
