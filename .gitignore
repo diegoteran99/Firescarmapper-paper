@@ -1,0 +1,16 @@
+results/
+
+firescarmapping/ep25_lr1e-04_bs16_021__as_std_adam_f01_13_07_x3.model
+
+.DS_Store
+Thumbs.db
+
+*.log
+*.tmp
+*.swp
+
+venv/
+env/
+
+*.pyc
+__pycache__/
