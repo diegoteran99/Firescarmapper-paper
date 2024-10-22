@@ -23,7 +23,6 @@
 """
 """
 TODO:
-- arreglar outptushs para que se pueda correr el codigo con 2 escalas distintas del mismo incendio
 - lograr que se use el punto de ignición para ver la diferencia 
 """
 from .resources import *
@@ -48,6 +47,23 @@ from qgis.PyQt.QtWidgets import QAction, QDialog, QVBoxLayout, QPushButton, QFil
 
 from PyQt5.QtWidgets import QVBoxLayout, QPushButton, QFileDialog, QLabel, QDialog, QTextEdit, QHBoxLayout, QMessageBox, QComboBox
 import geopandas as gpd
+
+import os
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from osgeo import gdal
+from geopandas import GeoDataFrame
+from shapely.geometry import Point
+
+
+import os
+import pandas as pd
+import numpy as np
+from osgeo import gdal
+from geopandas import GeoDataFrame
+from pathlib import Path
+from shapely.geometry import Point
 
 class FireScarMapper(QgsProcessingAlgorithm):
     IN_BEFORE = "BeforeRasters"
@@ -102,7 +118,10 @@ class FireScarMapper(QgsProcessingAlgorithm):
             
             if cropped == False:
                 # Obtener las coordenadas desde el archivo .shp usando el ID de la imagen
-                bounds = self.get_bounds_from_shp(shp_file, image_id)
+                if datatype == "AS":
+                    bounds = self.get_bounds_from_shp(shp_file, image_id)
+                
+                    
 
                 # Generar rutas para las imágenes recortadas
                 cropped_before_path = os.path.join(os.path.dirname(__file__), f'results/{datatype}', before_name.replace(".tif","_clip.tif"))
@@ -114,16 +133,29 @@ class FireScarMapper(QgsProcessingAlgorithm):
                 #cropped_paths = [cropped_before_path] + [cropped_burnt_path]
                 #feedback.pushInfo(f"{cropped_paths=}")
                 # Recortar las imágenes usando las coordenadas
-                self.crop_image_with_bounds(before_paths[i], cropped_before_path, bounds)
-                #feedback.pushInfo(f"Checking cropped before image at: {cropped_before_path}")
-                if not os.path.exists(cropped_before_path):
-                    raise QgsProcessingException(f"Failed to crop before image: {cropped_before_path}")
+                
+                if datatype == "AS":
+                    self.crop_image_with_bounds(before_paths[i], cropped_before_path, bounds)
+                    #feedback.pushInfo(f"Checking cropped before image at: {cropped_before_path}")
+                    if not os.path.exists(cropped_before_path):
+                        raise QgsProcessingException(f"Failed to crop before image: {cropped_before_path}")
 
-                self.crop_image_with_bounds(burnt_paths[i], cropped_burnt_path, bounds)
-                #feedback.pushInfo(f"Checking cropped burnt image at: {cropped_burnt_path}")
-                if not os.path.exists(cropped_burnt_path):
-                    raise QgsProcessingException(f"Failed to crop burnt image: {cropped_burnt_path}")
-
+                    self.crop_image_with_bounds(burnt_paths[i], cropped_burnt_path, bounds)
+                    #feedback.pushInfo(f"Checking cropped burnt image at: {cropped_burnt_path}")
+                    if not os.path.exists(cropped_burnt_path):
+                        raise QgsProcessingException(f"Failed to crop burnt image: {cropped_burnt_path}")
+                
+                else:
+                    self.cropping128_with_ignition_point(shp_file, before_paths[i], cropped_before_path, image_id)
+                    #feedback.pushInfo(f"Checking cropped before image at: {cropped_before_path}")
+                    if not os.path.exists(cropped_before_path):
+                        raise QgsProcessingException(f"Failed to crop before image: {cropped_before_path}")
+                    
+                    self.cropping128_with_ignition_point(shp_file, burnt_paths[i], cropped_burnt_path, image_id)
+                    #feedback.pushInfo(f"Checking cropped burnt image at: {cropped_burnt_path}")
+                    if not os.path.exists(cropped_burnt_path):
+                        raise QgsProcessingException(f"Failed to crop burnt image: {cropped_burnt_path}")
+                
 
                 # Cargar las imágenes recortadas como capas de QGIS
                 before.append(QgsRasterLayer(cropped_before_path, before_name.replace(".tif","_clip.tif"), "gdal"))
@@ -347,6 +379,73 @@ class FireScarMapper(QgsProcessingAlgorithm):
         
         # Cerrar la imagen de origen
         image = None
+
+
+
+
+    def cropping128_with_ignition_point(self, shp_file, ipname, output, fire_id):
+        """
+        Clip the satellite raster around the ignition point using the specified size.
+
+        Parameters:
+        shp_file: str - Path to the shapefile containing the ignition point
+        ipname: str - Path to the raster to be clipped
+        output: str - Path to save the cropped raster
+        fire_id: str - The fire ID used to match the ignition point in the shapefile
+        """
+        size = 128
+        # Step 1: Extract the ignition point coordinates from the shapefile using the fire ID
+        ignition_point = self.get_ignition_point_from_shp(shp_file, fire_id)
+
+        # Step 2: Open the input raster to get its geotransform and calculate bounds
+        inDs = gdal.Open(ipname)
+        ulx, xres, xskew, uly, yskew, yres = inDs.GetGeoTransform()
+
+        # Get the coordinates of the ignition point
+        ignition_x, ignition_y = ignition_point
+
+        # Step 3: Calculate the bounds of the cropping window around the ignition point
+        min_x = ignition_x - (size / 2) * xres
+        max_x = ignition_x + (size / 2) * xres
+        min_y = ignition_y + (size / 2) * yres  # yres is negative, hence addition
+        max_y = ignition_y - (size / 2) * yres
+
+        # Step 4: Perform the cropping using gdal.Warp
+        gdal.Warp(output, inDs, outputBounds=(min_x, min_y, max_x, max_y), dstNodata=0)
+
+        # Close the dataset
+        inDs = None
+
+
+    def get_ignition_point_from_shp(self, shp_file, fire_id):
+        """
+        Extract the ignition point coordinates from the shapefile using the fire ID.
+
+        Parameters:
+        shp_file: str - Path to the shapefile
+        fire_id: str - The fire ID used to filter the correct row
+        
+        Returns:
+        tuple: (longitude, latitude) coordinates of the ignition point
+        """
+        # Read the shapefile
+        gdf = GeoDataFrame.from_file(shp_file)
+
+        # Filter the shapefile using the fire ID
+        filtered_row = gdf[gdf['FireID'] == fire_id]
+
+        if filtered_row.empty:
+            raise ValueError(f"ID {fire_id} not found in the shapefile.")
+
+        # Extract the latitude and longitude from the columns 'Latitude_[' and 'Longitude_'
+        ignition_latitude = filtered_row['Latitude_['].values[0]
+        ignition_longitude = filtered_row['Longitude_'].values[0]
+
+        return ignition_longitude, ignition_latitude
+
+
+
+    
 
 
     def qgis2numpy_dtype(self, qgis_dtype: Qgis.DataType) -> np.dtype:
