@@ -23,7 +23,8 @@
 """
 """
 TODO:
-- lograr que se use el punto de ignición para ver la diferencia 
+- hacer que se utilicen los archivos ya generados de la carpeta results 
+- mejorar el diagrama que se muestra para que sea mas representativo
 """
 from .resources import *
 from .example_dialog import ExampleDialog
@@ -36,83 +37,40 @@ import torch
 from .firescarmapping.model_u_net import model, device
 from .firescarmapping.as_dataset import create_datasetAS
 from .firescarmapping.dataset_128 import create_dataset128
-
 import numpy as np
 from torch.utils.data import DataLoader
 import os
 from osgeo import gdal, gdal_array
 import requests
-from qgis.PyQt.QtGui import QColor, QIcon
+from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QDialog, QVBoxLayout, QPushButton, QFileDialog
-
 from PyQt5.QtWidgets import QVBoxLayout, QPushButton, QFileDialog, QLabel, QDialog, QTextEdit, QHBoxLayout, QMessageBox, QComboBox
 import geopandas as gpd
-
-import os
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from osgeo import gdal
 from geopandas import GeoDataFrame
-from shapely.geometry import Point
 
 
-import os
-import pandas as pd
-import numpy as np
-from osgeo import gdal
-from geopandas import GeoDataFrame
-from pathlib import Path
-from shapely.geometry import Point
-
-class FireScarMapper(QgsProcessingAlgorithm):
-    IN_BEFORE = "BeforeRasters"
-    IN_AFTER = "AfterRasters"
-    IN_SHP = "Shapefile"
-    OUT_SCARS = "OutputScars"
-    model_download_url = "https://fire2a-firescar-as-model.s3.amazonaws.com/ep25_lr1e-04_bs16_021__as_std_adam_f01_13_07_x3.model"
-    
+class FireScarMapper(QgsProcessingAlgorithm):    
     def processAlgorithm(self, parameters, context, feedback):
-        cropped = False
-        
-
         before_paths, burnt_paths, shp_file, datatype, cropped = parameters['BeforeRasters'], parameters['AfterRasters'], parameters['Shapefile'], parameters['ModelScale'], parameters['AlreadyCropped']
-        feedback.pushInfo(f"{datatype=}")
-        feedback.pushInfo(f"{cropped=}")
-        if datatype == "AS":
-            model_path = os.path.join(os.path.dirname(__file__), 'firescarmapping', 'ep25_lr1e-04_bs16_021__as_std_adam_f01_13_07_x3.model')
-            model_download_url = "https://fire2a-firescar-as-model.s3.amazonaws.com/ep25_lr1e-04_bs16_021__as_std_adam_f01_13_07_x3.model"
-        else:
-            model_path = os.path.join(os.path.dirname(__file__), 'firescarmapping', 'ep25_lr1e-04_bs16_014_128_std_25_08_mult3_adam01.model')
-            model_download_url = "https://fire2a-firescar-as-model.s3.amazonaws.com/ep25_lr1e-04_bs16_014_128_std_25_08_mult3_adam01.model"
-        
-        if not os.path.exists(model_path):
-            feedback.pushInfo("Model not found. Initializing download...")
-            self.download_model(model_path, model_download_url, feedback)
 
-        #feedback.pushInfo(f"Input rasters:\n names: {[r.name() for r in before]}\ntypes: {[r.rasterType() for r in before]}")
-        feedback.pushInfo(f"{before_paths=}")
-        #feedback.pushInfo(f"{burnt_paths=}")
         not_cropped_paths = before_paths + burnt_paths
-        #feedback.pushInfo(f"Input rasters:\n names: {[r.name() for r in burnt]}\ntypes: {[r.rasterType() for r in burnt]}")
         before, burnt, cropped_before_paths, cropped_burnt_paths = [], [], [], []
         
         results_dir = os.path.join(os.path.dirname(__file__), 'results')
-        model_dir = os.path.join(results_dir, datatype)
+        model_scale_dir = os.path.join(results_dir, datatype)
 
         # Crear el directorio 'results' si no existe
         if not os.path.exists(results_dir):
             os.makedirs(results_dir)
             feedback.pushInfo(f"Created main results directory at: {results_dir}")
 
-        if not os.path.exists(model_dir):
-            os.makedirs(model_dir)
-            feedback.pushInfo(f"Created directory for specified model at: {model_dir}")
+        if not os.path.exists(model_scale_dir):
+            os.makedirs(model_scale_dir)
+            feedback.pushInfo(f"Created directory for specified model at: {model_scale_dir}")
         
         
         for i in range(len(before_paths)):
             before_name = parameters['BeforeRasters'][i].split("/")[-1]
-            feedback.pushInfo(f"{before_name=}")
             burnt_name = parameters['AfterRasters'][i].split("/")[-1]
             image_id = before_name.split('_')[2]  # Suponiendo que el ID está en la tercera parte del nombre
             
@@ -121,8 +79,6 @@ class FireScarMapper(QgsProcessingAlgorithm):
                 if datatype == "AS":
                     bounds = self.get_bounds_from_shp(shp_file, image_id)
                 
-                    
-
                 # Generar rutas para las imágenes recortadas
                 cropped_before_path = os.path.join(os.path.dirname(__file__), f'results/{datatype}', before_name.replace(".tif","_clip.tif"))
                 cropped_before_paths.append(cropped_before_path)
@@ -130,8 +86,7 @@ class FireScarMapper(QgsProcessingAlgorithm):
                 cropped_burnt_path = os.path.join(os.path.dirname(__file__), f'results/{datatype}', burnt_name.replace(".tif","_clip.tif"))
                 cropped_burnt_paths.append(cropped_burnt_path)
                 #feedback.pushInfo(f"Cropping burnt image to: {cropped_burnt_path}")
-                #cropped_paths = [cropped_before_path] + [cropped_burnt_path]
-                #feedback.pushInfo(f"{cropped_paths=}")
+               
                 # Recortar las imágenes usando las coordenadas
                 
                 if datatype == "AS":
@@ -166,12 +121,6 @@ class FireScarMapper(QgsProcessingAlgorithm):
                 
         if cropped == False:
             cropped_paths = cropped_before_paths + cropped_burnt_paths
-        
-        #model_path = os.path.join(os.path.dirname(__file__), 'firescarmapping', 'ep25_lr1e-04_bs16_021__as_std_adam_f01_13_07_x3.model')
-        #model_path = os.path.join(os.path.dirname(__file__), 'firescarmapping', 'ep25_lr1e-04_bs16_014_128_std_25_08_mult3_adam01.model')
-
-        
-        if cropped == False:
             if not os.path.exists(cropped_before_path):
                 raise QgsProcessingException(f"Cropped image not found: {cropped_before_path}")
             if not os.path.exists(cropped_burnt_path):
@@ -191,36 +140,34 @@ class FireScarMapper(QgsProcessingAlgorithm):
                     "type": "before" if i < len(before) else "burnt",
                     "id": i,
                     "qid": layer.id(),
-                    "name": layer.name()[8:],
+                    "name": layer.name()[8:-9],
                     "data": self.get_rlayer_data(layer),
                     "layer": layer,
                     "path": cropped_paths[i],
                     "not_cropped_path": not_cropped_paths[i],
-                    "output_path":os.path.join(model_dir, f"FireScar_{layer.name()[8:][0:]}")
+                    "output_path":os.path.join(model_scale_dir, f"FireScar_{layer.name()[8:-9]}.tif")
                 }
                 adict.update(self.get_rlayer_info(layer))
                 rasters += [adict]
+               
         else:
             for i, layer in enumerate(before + burnt):
                 adict = {
                     "type": "before" if i < len(before) else "burnt",
                     "id": i,
                     "qid": layer.id(),
-                    "name": layer.name()[8:],
+                    "name": layer.name()[8:-9],
                     "data": self.get_rlayer_data(layer),
                     "layer": layer,
                     "path": not_cropped_paths[i],
                     "not_cropped_path": not_cropped_paths[i],
-                    "output_path":os.path.join(model_dir, f"FireScar_{layer.name()[8:][0:]}")
+                    "output_path":os.path.join(model_scale_dir, f"FireScar_{layer.name()[8:-9]}.tif")
                 }
                 adict.update(self.get_rlayer_info(layer))
                 rasters += [adict]
 
-        before_files = []
-        after_files = []
-        before_files_data = []
-        after_files_data = []
-
+        before_files, after_files, before_files_data, after_files_data = [], [], [], []
+      
         #Order rasters
         for i in range(len(rasters)//2):
             before_files.append(rasters[i])
@@ -230,10 +177,19 @@ class FireScarMapper(QgsProcessingAlgorithm):
                     after_files.append(rasters[j + (len(rasters)//2)])
                     after_files_data.append(after_files[i]['data'])
 
+        if datatype == "AS":
+            model_path = os.path.join(os.path.dirname(__file__), 'firescarmapping', 'ep25_lr1e-04_bs16_021__as_std_adam_f01_13_07_x3.model')
+            model_download_url = "https://fire2a-firescar-as-model.s3.amazonaws.com/ep25_lr1e-04_bs16_021__as_std_adam_f01_13_07_x3.model"
+        else:
+            model_path = os.path.join(os.path.dirname(__file__), 'firescarmapping', 'ep25_lr1e-04_bs16_014_128_std_25_08_mult3_adam01.model')
+            model_download_url = "https://fire2a-firescar-as-model.s3.amazonaws.com/ep25_lr1e-04_bs16_014_128_std_25_08_mult3_adam01.model"
+        
+        if not os.path.exists(model_path):
+            feedback.pushInfo("Model not found. Initializing download...")
+            self.download_model(model_path, model_download_url, feedback)
+
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-        feedback.pushInfo(f"{before_files=}")
-        feedback.pushInfo(f"{after_files=}")
         np.random.seed(3)
         torch.manual_seed(3)    
         
@@ -249,9 +205,6 @@ class FireScarMapper(QgsProcessingAlgorithm):
         model.eval()
 
         for i, batch in enumerate(all_dl):
-            feedback.pushInfo(f"{i=}")
-            feedback.pushInfo(f"{before_files[i]['name']=}")
-
             x = batch['img'].float().to(device)
             output = model(x).cpu()
 
@@ -275,12 +228,9 @@ class FireScarMapper(QgsProcessingAlgorithm):
                 if layer_tree:
                     layer_tree.setExpanded(False)
 
-                
                 self.writeRaster(generated_matrix, before_files[i]['output_path'], before_files[i], feedback)
                 self.addRasterLayer(before_files[i]['output_path'],f"FireScar_{before_files[i]['name']}", group, context)
                 self.addRasterLayer(after_files[i]['not_cropped_path'],f"ImgPosF_{after_files[i]['name']}", group, context)
-                feedback.pushInfo(f"After file path: {after_files[i]['path']}")
-                feedback.pushInfo(f"layer_name = ImgPosF_{after_files[i]['name']}")
                 self.addRasterLayer(before_files[i]['not_cropped_path'],f"ImgPreF_{before_files[i]['name']}", group, context)
         return {}
         
@@ -335,8 +285,6 @@ class FireScarMapper(QgsProcessingAlgorithm):
             # Manejo de cualquier error que pueda ocurrir durante la solicitud
             feedback.pushInfo(f"Failed to download model: {str(e)}")
     
-    
-
     def get_bounds_from_shp(self, shp_file, image_id):
         """Buscar las coordenadas de recorte en el archivo .shp usando el ID de la imagen."""
         # Leer el archivo .shp
@@ -355,7 +303,6 @@ class FireScarMapper(QgsProcessingAlgorithm):
         east_bound = filtered_row['EastBoundL'].values[0]
 
         return north_bound, south_bound, west_bound, east_bound
-
    
     def crop_image_with_bounds(self, image_path, output_path, bounds):
         """Recortar la imagen usando gdal y las coordenadas obtenidas del archivo .shp."""
@@ -379,9 +326,6 @@ class FireScarMapper(QgsProcessingAlgorithm):
         
         # Cerrar la imagen de origen
         image = None
-
-
-
 
     def cropping128_with_ignition_point(self, shp_file, ipname, output, fire_id):
         """
@@ -416,7 +360,6 @@ class FireScarMapper(QgsProcessingAlgorithm):
         # Close the dataset
         inDs = None
 
-
     def get_ignition_point_from_shp(self, shp_file, fire_id):
         """
         Extract the ignition point coordinates from the shapefile using the fire ID.
@@ -441,12 +384,7 @@ class FireScarMapper(QgsProcessingAlgorithm):
         ignition_latitude = filtered_row['Latitude_['].values[0]
         ignition_longitude = filtered_row['Longitude_'].values[0]
 
-        return ignition_longitude, ignition_latitude
-
-
-
-    
-
+        return ignition_longitude, ignition_latitude    
 
     def qgis2numpy_dtype(self, qgis_dtype: Qgis.DataType) -> np.dtype:
         """Conver QGIS data type to corresponding numpy data type
@@ -504,7 +442,6 @@ class FireScarMapper(QgsProcessingAlgorithm):
             "nodata": ndv,
             "bands": layer.bandCount(),
         }
-
 
     def get_rlayer_data(self, layer: QgsRasterLayer):
         """Get raster layer data (EVERY BAND) as numpy array; Also returns nodata value, width and height
@@ -649,7 +586,6 @@ class FireScarMapper(QgsProcessingAlgorithm):
             layer.triggerRepaint()
             layer.reload()
 
-
     def name(self):
         return "firescarmapper"
     
@@ -661,8 +597,6 @@ class FireScarMapper(QgsProcessingAlgorithm):
 
     def createInstance(self):
         return FireScarMapper()
-
-
 
 
 class LayerSelectionDialog(QDialog):
@@ -833,9 +767,6 @@ class LayerSelectionDialog(QDialog):
         feedback.pushInfo("Fire scar mapping process completed successfully.")
 
         self.close()
-
-
-
 
 
 class Example:
